@@ -1,0 +1,77 @@
+diff --git a/packages/session/session-persistence-jsonl/src/format.ts b/packages/session/session-persistence-jsonl/src/format.ts
+index 2923b9e..5fe8d4e 100644
+--- a/packages/session/session-persistence-jsonl/src/format.ts
++++ b/packages/session/session-persistence-jsonl/src/format.ts
+@@ -361,17 +361,24 @@ export class SessionLogScanner {
+ 
+     const rowStart = this.events.length
+     for (const event of decoded) {
+-      if (event.seq !== this.events.length) {
+-        const expected = this.events.length
+-        this.events.length = rowStart
+-        this.issue = new Error(
+-          `corrupt session log: seq gap in committed region at line ${this.eventLine} `
+-          + `(expected ${expected}, got ${event.seq})`,
+-        )
+-        if (decoded.some(candidate => candidate.type === 'turn/end')) throw this.issue
+-        return
++      if (event.seq === this.events.length) {
++        this.events.push(event)
++        continue
+       }
+-      this.events.push(event)
++      if (event.seq < this.events.length) {
++        // Stale duplicate left by an interrupted rewrite: skip it and keep
++        // scanning; the cursor resyncs once the duplicated region ends.
++        continue
++      }
++      // A forward gap (events genuinely missing) is unrecoverable.
++      const expected = this.events.length
++      this.events.length = rowStart
++      this.issue = new Error(
++        `corrupt session log: seq gap in committed region at line ${this.eventLine} `
++        + `(expected ${expected}, got ${event.seq})`,
++      )
++      if (decoded.some(candidate => candidate.type === 'turn/end')) throw this.issue
++      return
+     }
+     this.committedBytes = endByte
+   }
+diff --git a/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts b/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
+index 70ae6d1..e9495f2 100644
+--- a/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
++++ b/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
+@@ -855,6 +855,33 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
+     ].join('\n'))) }).toThrow(/seq gap in committed region/)
+   })
+ 
++  it('skips stale duplicate events left by an interrupted rewrite and resyncs', () => {
++    const header = Buffer.from(`${JSON.stringify(toHeaderLine(meta('scanner-rewrite-duplicates')))}\n`)
++    const events = oneTurnLog()
++    const stale = [events[2], events[3]] // seq 2..3 re-emitted by the interrupted rewrite
++    const rows = [...events.slice(0, 4), ...stale, ...events.slice(4)]
++    const scanner = new SessionLogScanner(header)
++    scanner.write(Buffer.from(rows.map(event => JSON.stringify(event)).join('\n') + '\n'))
++    const result = scanner.finish()
++    expect(result.events).toEqual(events)
++    expect(result.committedBytes).toBe(
++      header.length + rows.map(event => JSON.stringify(event)).join('\n').length + 1,
++    )
++  })
++
++  it('skips a stale duplicated suffix even when it repeats turn end events', () => {
++    const header = Buffer.from(`${JSON.stringify(toHeaderLine(meta('scanner-rewrite-duplicate-suffix')))}\n`)
++    const events = oneTurnLog()
++    const rows = [...events, ...events.slice(4)] // seq 4..5 duplicated at the end
++    const scanner = new SessionLogScanner(header)
++    scanner.write(Buffer.from(rows.map(event => JSON.stringify(event)).join('\n') + '\n'))
++    const result = scanner.finish()
++    expect(result.events).toEqual(events)
++    expect(result.committedBytes).toBe(
++      header.length + rows.map(event => JSON.stringify(event)).join('\n').length + 1,
++    )
++  })
++
+   it('incrementally scans records split across reusable decoder chunks', () => {
+     const header = Buffer.from(`${JSON.stringify(toHeaderLine(meta('incremental')))}\n`)
+     const body = Buffer.from(`${oneTurnLog().map(event => JSON.stringify(event)).join('\n').replace('"hi"', '"你好"')}\n`)

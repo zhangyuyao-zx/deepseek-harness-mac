@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>DeepSeek助手</string>
+	<key>CFBundleDisplayName</key>
+	<string>DeepSeek 助手</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.deepseek.assistant</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleExecutable</key>
+	<string>DeepSeekAssistant</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>基于 DeepSeek Harness 开源项目（MIT）</string>
+</dict>
+</plist>
