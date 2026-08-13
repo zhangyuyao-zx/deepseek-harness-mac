@@ -18,7 +18,7 @@
 
 ## 快速安装
 
-1. 从 [Releases](https://github.com/zhangyuyao-zx/deepseek-assistant-mac/releases) 下载 `DeepSeek助手-1.0.0.zip`
+1. 从 [Releases](https://github.com/zhangyuyao-zx/deepseek-harness-mac/releases) 下载 `DeepSeek助手-1.0.0.zip`
 2. 解压后把 `DeepSeek助手.app` 拖入「应用程序」文件夹
 3. 双击运行（首次启动允许通知权限，体验更好）
 
