@@ -8,6 +8,8 @@
 	<string>DeepSeek 助手</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.deepseek.assistant</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.0</string>
 	<key>CFBundleVersion</key>

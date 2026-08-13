@@ -45,6 +45,7 @@ let kLogDirURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("DeepSeek助手")
 
 let kUserDefaultsWorkspaceKey = "workspacePath"
+let kAppPidFile = kLogDirURL.appendingPathComponent("app.pid")
 
 /// 应用自身日志（写到 ~/Library/Logs/DeepSeek助手/app.log，便于排查）
 func appLog(_ message: String) {
@@ -186,20 +187,12 @@ final class ServerManager {
         try? FileManager.default.createDirectory(at: kLogDirURL, withIntermediateDirectories: true)
         let logURL = kLogDirURL.appendingPathComponent("server.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        let logPipe = Pipe()
-        proc.standardOutput = logPipe
-        proc.standardError = logPipe
-        let logQueue = DispatchQueue(label: "dsh-server-log")
-        logPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty { return }
-            logQueue.async {
-                if let fh = try? FileHandle(forWritingTo: logURL) {
-                    fh.seekToEndOfFile()
-                    fh.write(data)
-                    try? fh.close()
-                }
-            }
+        // stdout/stderr 直接落到日志文件:服务进程完全独立于应用生命周期,
+        // 应用退出后任务(含子代理)继续在后台运行
+        if let logFH = try? FileHandle(forWritingTo: logURL) {
+            logFH.seekToEndOfFile()
+            proc.standardOutput = logFH
+            proc.standardError = logFH
         }
 
         proc.terminationHandler = { [weak self] p in
@@ -243,18 +236,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var hotKeyHandlerRef: EventHandlerRef?
     var hotKeyRef: EventHotKeyRef?
     var spawnedReadyNotified = false
+    var fullShutdown = false
+    var filesPanel: FilesPanel?
+    var filesPanelWidth: NSLayoutConstraint?
+    var filesPanelOpen = false
+    var filesTimer: Timer?
+    let activeTracker = ActiveSessionTracker()
+    let deliveredReader = DeliveredFilesReader()
+    var lastExtraction: (sessionId: String, ledgerSize: Int)?
+    var lastEntries: [FileEntry] = []
+    var currentSessionId: String?
 
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 单实例:已有实例运行时激活它并退出,避免多个实例争抢服务
+        // 自检模式:验证「本次对话交付文件」提取,输出日志后退出(无窗口)
+        if CommandLine.arguments.contains("--selfcheck") {
+            var target: String?
+            if let i = CommandLine.arguments.firstIndex(of: "--selfcheck"),
+               i + 1 < CommandLine.arguments.count {
+                target = CommandLine.arguments[i + 1]
+            }
+            let sema = DispatchSemaphore(value: 0)
+            var entries: [FileEntry] = []
+            runDeliveredRead(preferredSessionId: target) { result in
+                entries = result
+                sema.signal()
+            }
+            while sema.wait(timeout: .now()) == .timedOut {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            appLog("selfcheck: entries=\(entries.count)")
+            for entry in entries.prefix(12) {
+                appLog("selfcheck: \(entry.relativePath) | \(entry.size)B | \(entry.modifiedAt)")
+            }
+            exit(0)
+        }
+        // 单实例:基于 PID 文件判断(不依赖 LaunchServices 注册,避免残留导致新实例秒退)
         let myPid = ProcessInfo.processInfo.processIdentifier
-        if let other = NSRunningApplication.runningApplications(withBundleIdentifier: "com.deepseek.assistant")
-            .first(where: { $0.processIdentifier != myPid }) {
-            other.activate(options: [.activateAllWindows])
+        if let data = try? Data(contentsOf: kAppPidFile),
+           let text = String(data: data, encoding: .utf8),
+           let otherPid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+           otherPid != myPid,
+           kill(otherPid, 0) == 0 {
+            // 已有实例存活:激活它并退出
+            NSRunningApplication(processIdentifier: otherPid)?.activate(options: [.activateAllWindows])
             NSApp.terminate(nil)
             return
         }
+        try? FileManager.default.createDirectory(at: kLogDirURL, withIntermediateDirectories: true)
+        try? String(myPid).write(to: kAppPidFile, atomically: true, encoding: .utf8)
         appLog("launch, workspace=" + configuredWorkspaceURL().path)
         buildMenu()
         buildWindow()
@@ -273,7 +304,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appLog("will terminate, stopping owned server (startedByUs=\(server.startedByUs))")
+        appLog("will terminate, fullShutdown=\(fullShutdown) (startedByUs=\(server.startedByUs))")
+        if !fullShutdown {
+            appLog("server kept running in background (tasks continue)")
+        } else {
+            server.stop()
+        }
+        // 清理 PID 文件(仅当它还指向自己)
+        if let data = try? Data(contentsOf: kAppPidFile),
+           let text = String(data: data, encoding: .utf8),
+           pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) == ProcessInfo.processInfo.processIdentifier {
+            try? FileManager.default.removeItem(at: kAppPidFile)
+        }
+        stopFilesTimer()
         server.stop()
         if let ref = hotKeyHandlerRef { RemoveEventHandler(ref) }
     }
@@ -321,6 +364,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         title.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(title)
 
+        // 上传文件到工作区按钮
+        let uploadButton = NSButton(image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "添加文件") ?? NSImage(),
+                                    target: self, action: #selector(uploadFileToWorkspace))
+        uploadButton.isBordered = false
+        uploadButton.toolTip = "添加文件到工作区（复制后把文件名粘贴到对话中）"
+        uploadButton.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(uploadButton)
+
+        // 右侧「对话文件」面板开关按钮
+        let filesButton = NSButton(image: NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "对话文件") ?? NSImage(),
+                                   target: self, action: #selector(toggleFilesPanel))
+        filesButton.isBordered = false
+        filesButton.toolTip = "对话文件面板（⇧⌘F）"
+        filesButton.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(filesButton)
+
         // WebView
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
@@ -333,6 +392,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         content.addSubview(web)
         webView = web
 
+        // 右侧「对话文件」面板
+        let panel = FilesPanel(frame: .zero)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.isHidden = true
+        panel.onOpenFile = { url in NSWorkspace.shared.open(url) }
+        panel.onRevealFile = { url in NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        content.addSubview(panel)
+        filesPanel = panel
+
+        filesPanelWidth = panel.widthAnchor.constraint(equalToConstant: 0)
+
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo: content.topAnchor),
             bar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -340,15 +410,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             bar.heightAnchor.constraint(equalToConstant: 38),
             title.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
             title.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            filesButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+            filesButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            uploadButton.trailingAnchor.constraint(equalTo: filesButton.leadingAnchor, constant: -10),
+            uploadButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
             web.topAnchor.constraint(equalTo: bar.bottomAnchor),
             web.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            web.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            web.trailingAnchor.constraint(equalTo: panel.leadingAnchor),
             web.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            panel.topAnchor.constraint(equalTo: bar.bottomAnchor),
+            panel.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            panel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            filesPanelWidth!,
         ])
+
+        // 恢复面板开关状态
+        let panelWasOpen = UserDefaults.standard.bool(forKey: "filesPanelOpen")
+        setFilesPanelOpen(panelWasOpen, animated: false)
 
         showLoadingPage()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: 对话文件面板
+
+    @objc func toggleFilesPanel() {
+        setFilesPanelOpen(!filesPanelOpen, animated: true)
+    }
+
+    func setFilesPanelOpen(_ open: Bool, animated: Bool) {
+        filesPanelOpen = open
+        UserDefaults.standard.set(open, forKey: "filesPanelOpen")
+        filesPanelWidth?.constant = open ? 280 : 0
+        filesPanel?.isHidden = false
+        let apply = {
+            self.window.contentView?.layoutSubtreeIfNeeded()
+        }
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                ctx.allowsImplicitAnimation = true
+                apply()
+            }, completionHandler: {
+                self.filesPanel?.isHidden = !open
+            })
+        } else {
+            apply()
+            filesPanel?.isHidden = !open
+        }
+        if open {
+            appLog("files panel opened")
+            refreshFilesPanel()
+            startFilesTimer()
+        } else {
+            appLog("files panel closed")
+            stopFilesTimer()
+        }
+    }
+
+    func refreshFilesPanel() {
+        guard filesPanelOpen else { return }
+        pollCurrentSessionId { [weak self] sessionId in
+            self?.runDeliveredRead(preferredSessionId: sessionId) { entries in
+                self?.filesPanel?.show(entries: entries)
+            }
+        }
+    }
+
+    /// 从 GUI 的 localStorage(dsh.sessions.current)读取正在查看的会话 id
+    func pollCurrentSessionId(_ completion: @escaping (String?) -> Void) {
+        guard let webView else {
+            completion(nil)
+            return
+        }
+        let script = """
+        (() => { try { return JSON.stringify({ raw: localStorage.getItem('dsh.sessions.current') }) } catch (e) { return JSON.stringify({ raw: null }) } })()
+        """
+        webView.evaluateJavaScript(script) { result, _ in
+            guard let json = result as? String,
+                  let data = json.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let raw = obj["raw"] as? String,
+                  let rawData = raw.data(using: .utf8),
+                  let selection = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any] else {
+                completion(nil)
+                return
+            }
+            completion(selection["sessionId"] as? String)
+        }
+    }
+
+    /// 读取当前对话的交付清单(delivered.json);没有清单 = 本次对话没有交付文件
+    func runDeliveredRead(preferredSessionId: String?, _ completion: @escaping ([FileEntry]) -> Void) {
+        var sid: String?
+        if let p = preferredSessionId {
+            sid = p
+            currentSessionId = p
+        } else if let last = currentSessionId {
+            sid = last
+        } else {
+            sid = activeTracker.activeSession()?.sessionId
+        }
+        guard let sid, let dir = activeTracker.directoryURL(for: sid) else {
+            appLog("delivered: no session found")
+            completion([])
+            return
+        }
+        let ledger = dir.appendingPathComponent("delivered.json")
+        let ledgerSize = ((try? FileManager.default.attributesOfItem(atPath: ledger.path)[.size]) as? Int) ?? 0
+        if let last = lastExtraction, last.sessionId == sid, last.ledgerSize == ledgerSize {
+            completion(lastEntries)
+            return
+        }
+        lastExtraction = (sid, ledgerSize)
+        let entries = deliveredReader.read(sessionDir: dir, workspace: configuredWorkspaceURL())
+        lastEntries = entries
+        appLog("delivered: session \(sid) delivered \(entries.count) files")
+        completion(entries)
+    }
+
+    func startFilesTimer() {
+        stopFilesTimer()
+        filesTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.refreshFilesPanel()
+        }
+    }
+
+    func stopFilesTimer() {
+        filesTimer?.invalidate()
+        filesTimer = nil
     }
 
     // MARK: 菜单
@@ -368,9 +559,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         action: #selector(NSApplication.hide(_:)),
                         keyEquivalent: "h")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "退出 DeepSeek 助手",
-                        action: #selector(NSApplication.terminate(_:)),
-                        keyEquivalent: "q")
+        let quitSoft = NSMenuItem(title: "退出 DeepSeek 助手（服务继续后台运行）",
+                                 action: #selector(quitKeepingServer), keyEquivalent: "q")
+        quitSoft.target = self
+        appMenu.addItem(quitSoft)
+        let quitFull = NSMenuItem(title: "退出并停止服务（终止所有进行中的任务）",
+                                 action: #selector(quitStoppingServer), keyEquivalent: "")
+        quitFull.target = self
+        appMenu.addItem(quitFull)
+
+        // 编辑菜单:WKWebView 的 ⌘C/⌘V/⌘X/⌘A/⌘Z 快捷键需要菜单项路由
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "编辑")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "剪切", action: Selector(("cut:")), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: Selector(("copy:")), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: Selector(("paste:")), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: Selector(("selectAll:")), keyEquivalent: "a")
 
         let viewItem = NSMenuItem()
         mainMenu.addItem(viewItem)
@@ -380,12 +589,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         viewMenu.addItem(menuItem("后退", #selector(goBack), "["))
         viewMenu.addItem(menuItem("前进", #selector(goForward), "]"))
         viewMenu.addItem(menuItem("实际大小", #selector(resetZoom), "0"))
+        viewMenu.addItem(NSMenuItem.separator())
+        viewMenu.addItem(menuItem("对话文件面板", #selector(toggleFilesPanel), "f",
+                                  NSEvent.ModifierFlags.command.union(.shift)))
 
         let goItem = NSMenuItem()
         mainMenu.addItem(goItem)
         let goMenu = NSMenu(title: "前往")
         goItem.submenu = goMenu
         goMenu.addItem(menuItem("重新连接服务", #selector(reconnect), "", []))
+        goMenu.addItem(menuItem("打开工作区文件夹", #selector(openWorkspaceFolder), "", []))
         goMenu.addItem(menuItem("在浏览器中打开", #selector(openInBrowser), "o",
                                 NSEvent.ModifierFlags.command.union(.shift)))
         goMenu.addItem(menuItem("打开服务器日志", #selector(openServerLog), "", []))
@@ -438,6 +651,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
+    @objc func quitKeepingServer() {
+        fullShutdown = false
+        NSApp.terminate(nil)
+    }
+
+    @objc func quitStoppingServer() {
+        fullShutdown = true
+        NSApp.terminate(nil)
+    }
+
+    @objc func uploadFileToWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "添加到工作区"
+        panel.message = "文件会复制到工作区的「上传文件」文件夹，文件名复制到剪贴板，粘贴到对话中即可让助手使用"
+        guard panel.runModal() == .OK else { return }
+        let ws = configuredWorkspaceURL()
+        let destDir = ws.appendingPathComponent("上传文件")
+        try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        var names: [String] = []
+        for url in panel.urls {
+            let name = url.lastPathComponent
+            var dest = destDir.appendingPathComponent(name)
+            var n = 1
+            while FileManager.default.fileExists(atPath: dest.path) {
+                let base = (name as NSString).deletingPathExtension
+                let ext = (name as NSString).pathExtension
+                dest = destDir.appendingPathComponent(ext.isEmpty ? "\(base)-\(n)" : "\(base)-\(n).\(ext)")
+                n += 1
+            }
+            do {
+                try FileManager.default.copyItem(at: url, to: dest)
+                names.append(dest.lastPathComponent)
+            } catch {
+                appLog("upload copy failed: \(error)")
+            }
+        }
+        guard !names.isEmpty else { return }
+        let text = names.joined(separator: "、")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        notify("文件已添加到工作区", "\(names.count) 个文件已放入「上传文件」文件夹，文件名已复制到剪贴板，粘贴到对话中告诉助手即可。")
+    }
+
+    @objc func openWorkspaceFolder() {
+        NSWorkspace.shared.open(configuredWorkspaceURL())
+    }
+
     @objc func toggleWindow() {
         guard let window else { return }
         if window.isVisible && NSApp.isActive {
@@ -466,8 +729,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         launch.state = launchAtLoginEnabled() ? .on : .off
         menu.addItem(launch)
         menu.addItem(NSMenuItem.separator())
-        let quit = NSMenuItem(title: "退出 DeepSeek 助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        let quitSoft = NSMenuItem(title: "退出（服务继续后台运行）", action: #selector(quitKeepingServer), keyEquivalent: "q")
+        quitSoft.target = self
+        menu.addItem(quitSoft)
+        let quitFull = NSMenuItem(title: "退出并停止服务（终止进行中的任务）", action: #selector(quitStoppingServer), keyEquivalent: "")
+        quitFull.target = self
+        menu.addItem(quitFull)
         item.menu = menu
         statusItem = item
         launchAtLoginItem = launch
@@ -687,21 +954,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     // MARK: 页面状态
 
     func showLoadingPage() {
+        let icon = loadingIconBase64()
+        let iconHTML = icon.isEmpty
+            ? "<div class=\"spinner\"></div>"
+            : "<img class=\"logo\" src=\"data:image/png;base64,\(icon)\" alt=\"DeepSeek 助手\" />"
         let html = """
         <!doctype html><html><head><meta charset="utf-8"><style>
         body{margin:0;background:#10131c;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#8a93a8}
         .wrap{text-align:center}
+        .logo{width:96px;height:96px;border-radius:24px;box-shadow:0 10px 36px rgba(0,0,0,.5);animation:pulse 1.6s ease-in-out infinite}
         .spinner{width:44px;height:44px;margin:0 auto 18px;border:3px solid rgba(120,140,255,.2);border-top-color:#5b7fff;border-radius:50%;animation:spin 1s linear infinite}
+        @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
         @keyframes spin{to{transform:rotate(360deg)}}
-        .t{font-size:16px;font-weight:600;color:#dbe2f0}
+        .t{margin-top:22px;font-size:16px;font-weight:600;color:#dbe2f0}
         .s{margin-top:6px;font-size:13px}
         </style></head><body><div class="wrap">
-        <div class="spinner"></div>
+        \(iconHTML)
         <div class="t">正在启动 DeepSeek 助手…</div>
         <div class="s">首次启动需要几秒钟，请稍候</div>
         </div></body></html>
         """
         webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    /// 从应用图标生成 base64 PNG(加载页展示)
+    func loadingIconBase64() -> String {
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let image = NSImage(contentsOf: url),
+           let tiff = image.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return png.base64EncodedString()
+        }
+        return ""
     }
 
     func showLoadError() {
@@ -831,12 +1116,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
+let kAppLaunchDate = Date()
+// 声明应用语言为简体中文:WKWebView 据此向网页报告 navigator.language,
+// dsh GUI 的初始界面语言由此决定(否则默认跟随英文系统)
+UserDefaults.standard.set(["zh-Hans"], forKey: "AppleLanguages")
+UserDefaults.standard.set("zh-Hans", forKey: "AppleLocale")
 kPort = resolvePort()
 appLog("start, port=\(kPort), pid=\(ProcessInfo.processInfo.processIdentifier)")
 
 // 优雅退出：收到 SIGTERM/SIGINT 时走正常终止流程（回收自启的 dsh 服务）
-signal(SIGTERM) { _ in DispatchQueue.main.async { NSApp.terminate(nil) } }
-signal(SIGINT) { _ in DispatchQueue.main.async { NSApp.terminate(nil) } }
+signal(SIGTERM) { _ in DispatchQueue.main.async {
+    delegate.fullShutdown = true
+    NSApp.terminate(nil)
+} }
+signal(SIGINT) { _ in DispatchQueue.main.async {
+    delegate.fullShutdown = true
+    NSApp.terminate(nil)
+} }
 
 app.delegate = delegate
 app.setActivationPolicy(.regular)

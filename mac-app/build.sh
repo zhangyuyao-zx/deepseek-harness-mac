@@ -18,7 +18,7 @@ mkdir -p "$BUNDLE/MacOS" "$BUNDLE/Resources" out/AppIcon.iconset
 echo "[1/4] 编译 Swift…"
 swiftc -sdk "$SDK" -module-cache-path "$CACHE/module" \
   -O -swift-version 5 -framework AppKit -framework WebKit \
-  -o "$BIN" src/main.swift
+  -o "$BIN" src/main.swift src/FilesPanel.swift
 
 echo "[2/4] 生成图标…"
 if [ -f "icon-source.png" ]; then
