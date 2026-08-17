@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 
 // MARK: - 数据模型
 
@@ -165,9 +166,82 @@ enum UsageFetcher {
     }
 }
 
+
+// MARK: - 内嵌 DeepSeek 官方平台用量页(登录会话直连账号数据)
+
+final class PlatformUsageController: NSObject, WKNavigationDelegate {
+    private var window: NSWindow?
+    private var webView: WKWebView?
+
+    func show() {
+        if window == nil { build() }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if let wv = webView, wv.url == nil {
+            wv.load(URLRequest(url: URL(string: "https://platform.deepseek.com/usage")!))
+        }
+    }
+
+    private func build() {
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780),
+                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        win.title = "DeepSeek 平台用量（官方账号数据）"
+        win.center()
+        win.isReleasedWhenClosed = false
+        window = win
+
+        let content = NSView(frame: win.contentView!.bounds)
+        win.contentView = content
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let wv = WKWebView(frame: .zero, configuration: config)
+        wv.navigationDelegate = self
+        wv.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(wv)
+        webView = wv
+
+        let bar = NSStackView()
+        bar.orientation = .horizontal
+        bar.spacing = 8
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        let back = NSButton(title: "←", target: self, action: #selector(goBack))
+        let fwd = NSButton(title: "→", target: self, action: #selector(goForward))
+        let reload = NSButton(title: "刷新", target: self, action: #selector(reloadPage))
+        let openExternal = NSButton(title: "在浏览器打开", target: self, action: #selector(openExternal))
+        for b in [back, fwd, reload, openExternal] { b.bezelStyle = .rounded; b.controlSize = .small }
+        bar.addArrangedSubview(back)
+        bar.addArrangedSubview(fwd)
+        bar.addArrangedSubview(reload)
+        bar.addArrangedSubview(openExternal)
+        content.addSubview(bar)
+
+        NSLayoutConstraint.activate([
+            bar.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            wv.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 8),
+            wv.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            wv.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            wv.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+
+        wv.load(URLRequest(url: URL(string: "https://platform.deepseek.com/usage")!))
+    }
+
+    @objc func goBack() { webView?.goBack() }
+    @objc func goForward() { webView?.goForward() }
+    @objc func reloadPage() { webView?.reload() }
+    @objc func openExternal() {
+        if let url = webView?.url ?? URL(string: "https://platform.deepseek.com/usage") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
 // MARK: - 用量与余额窗口
 
 final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    private let platformUsage = PlatformUsageController()
     private var window: NSWindow?
     private var rows: [UsageRow] = []
     private let tableView = NSTableView()
@@ -215,6 +289,11 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         platformLink.bezelStyle = .inline
         platformLink.controlSize = .small
         platformLink.translatesAutoresizingMaskIntoConstraints = false
+
+        let embeddedLink = NSButton(title: "内嵌查看官方用量（登录后直连账号数据）", target: self, action: #selector(openPlatformEmbedded))
+        embeddedLink.bezelStyle = .inline
+        embeddedLink.controlSize = .small
+        embeddedLink.translatesAutoresizingMaskIntoConstraints = false
 
         keyField.placeholderString = "未找到 API Key 时，可在此粘贴 sk-... 后点保存"
         keyField.font = .systemFont(ofSize: 11)
@@ -285,6 +364,8 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
             refreshButton.leadingAnchor.constraint(equalTo: balanceLabel.trailingAnchor, constant: 16),
             platformLink.centerYAnchor.constraint(equalTo: balanceLabel.centerYAnchor),
             platformLink.leadingAnchor.constraint(equalTo: refreshButton.trailingAnchor, constant: 8),
+            embeddedLink.centerYAnchor.constraint(equalTo: balanceLabel.centerYAnchor),
+            embeddedLink.leadingAnchor.constraint(equalTo: platformLink.trailingAnchor, constant: 12),
             keyField.topAnchor.constraint(equalTo: balanceLabel.bottomAnchor, constant: 8),
             keyField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             keyField.trailingAnchor.constraint(equalTo: saveKeyButton.leadingAnchor, constant: -8),
@@ -370,6 +451,10 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         if let url = URL(string: "https://platform.deepseek.com/usage") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc func openPlatformEmbedded() {
+        platformUsage.show()
     }
 
     // MARK: 表格
