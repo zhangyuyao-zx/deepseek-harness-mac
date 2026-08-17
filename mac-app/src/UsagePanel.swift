@@ -9,6 +9,48 @@ struct UsageRow {
     let cacheReadTokens: Int64
 }
 
+/// DeepSeek 官方定价(元/百万 tokens),来源 api-docs.deepseek.com 模型与价格页
+struct ModelPricing {
+    let name: String
+    let inputMissOffPeak: Double
+    let inputMissPeak: Double
+    let inputHitOffPeak: Double
+    let inputHitPeak: Double
+    let outputOffPeak: Double
+    let outputPeak: Double
+
+    static let v4pro = ModelPricing(
+        name: "deepseek-v4-pro",
+        inputMissOffPeak: 4.5, inputMissPeak: 9.0,
+        inputHitOffPeak: 0.15, inputHitPeak: 0.30,
+        outputOffPeak: 13.5, outputPeak: 27.0
+    )
+    static let v4flash = ModelPricing(
+        name: "deepseek-v4-flash",
+        inputMissOffPeak: 1.5, inputMissPeak: 3.0,
+        inputHitOffPeak: 0.05, inputHitPeak: 0.10,
+        outputOffPeak: 4.5, outputPeak: 9.0
+    )
+
+    /// 是否处于高峰时段(北京时间 9:00-12:00、14:00-18:00)
+    static func isPeakHour(_ date: Date = Date()) -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let hour = calendar.component(.hour, from: date)
+        return (hour >= 9 && hour < 12) || (hour >= 14 && hour < 18)
+    }
+
+    func cost(row: UsageRow) -> Double {
+        let peak = ModelPricing.isPeakHour()
+        let missRate = peak ? inputMissPeak : inputMissOffPeak
+        let hitRate = peak ? inputHitPeak : inputHitOffPeak
+        let outRate = peak ? outputPeak : outputOffPeak
+        return (Double(row.inputTokens) * missRate
+                + Double(row.cacheReadTokens) * hitRate
+                + Double(row.outputTokens) * outRate) / 1_000_000
+    }
+}
+
 // MARK: - 数据获取:本地 token 用量 + DeepSeek API 余额
 
 enum UsageFetcher {
@@ -133,7 +175,10 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
     private let totalLabel = NSTextField(labelWithString: "")
     private let keyField = NSTextField(string: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let kSavedKey = "deepseekAPIKey"
+
+    private var pricing: ModelPricing { modelPopup.indexOfSelectedItem == 1 ? .v4flash : .v4pro }
 
     func show() {
         if window == nil { buildWindow() }
@@ -144,7 +189,7 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     private func buildWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 640, height: 520)
+        let rect = NSRect(x: 0, y: 0, width: 720, height: 540)
         let win = NSWindow(contentRect: rect, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         win.title = "用量与余额"
         win.center()
@@ -174,22 +219,27 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         keyField.placeholderString = "未找到 API Key 时，可在此粘贴 sk-... 后点保存"
         keyField.font = .systemFont(ofSize: 11)
         keyField.translatesAutoresizingMaskIntoConstraints = false
-        keyField.delegate = nil
 
         let saveKeyButton = NSButton(title: "保存 Key", target: self, action: #selector(saveKey))
         saveKeyButton.bezelStyle = .rounded
         saveKeyButton.controlSize = .small
         saveKeyButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let usageTitle = NSTextField(labelWithString: "本地 Token 用量（全部会话）")
+        let usageTitle = NSTextField(labelWithString: "本地 Token 用量与费用估算")
         usageTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         usageTitle.translatesAutoresizingMaskIntoConstraints = false
+
+        modelPopup.addItems(withTitles: ["deepseek-v4-pro", "deepseek-v4-flash"])
+        modelPopup.target = self
+        modelPopup.action = #selector(modelChanged)
+        modelPopup.controlSize = .small
+        modelPopup.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let columns: [(String, CGFloat)] = [("会话", 260), ("输入", 90), ("输出", 90), ("缓存读取", 100)]
+        let columns: [(String, CGFloat)] = [("会话", 280), ("输入", 85), ("输出", 85), ("缓存读取", 90), ("费用(元)", 90)]
         for (name, width) in columns {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(name))
             col.title = name
@@ -221,6 +271,7 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         content.addSubview(saveKeyButton)
         content.addSubview(divider)
         content.addSubview(usageTitle)
+        content.addSubview(modelPopup)
         content.addSubview(statusLabel)
         content.addSubview(scroll)
         content.addSubview(totalLabel)
@@ -244,8 +295,10 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             usageTitle.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 12),
             usageTitle.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            modelPopup.centerYAnchor.constraint(equalTo: usageTitle.centerYAnchor),
+            modelPopup.leadingAnchor.constraint(equalTo: usageTitle.trailingAnchor, constant: 12),
             statusLabel.centerYAnchor.constraint(equalTo: usageTitle.centerYAnchor),
-            statusLabel.leadingAnchor.constraint(equalTo: usageTitle.trailingAnchor, constant: 12),
+            statusLabel.leadingAnchor.constraint(equalTo: modelPopup.trailingAnchor, constant: 12),
             scroll.topAnchor.constraint(equalTo: usageTitle.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
@@ -266,8 +319,18 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         let totalInput = rows.reduce(0) { $0 + $1.inputTokens }
         let totalOutput = rows.reduce(0) { $0 + $1.outputTokens }
         let totalCache = rows.reduce(0) { $0 + $1.cacheReadTokens }
-        totalLabel.stringValue = "总计：\(rows.count) 个会话 · 输入 \(Self.fmt(totalInput)) · 输出 \(Self.fmt(totalOutput)) · 缓存读取 \(Self.fmt(totalCache))"
-        statusLabel.stringValue = "数据来自本机 dsh 会话缓存（~/.dsh/storages）"
+        let totalCost = rows.reduce(0.0) { $0 + pricing.cost(row: $1) }
+        let peak = ModelPricing.isPeakHour()
+        totalLabel.stringValue = String(
+            format: "总计：%d 个会话 · 输入 %@ · 输出 %@ · 缓存读取 %@ · 估算费用 ¥%.2f（%@时段单价）",
+            rows.count, Self.fmt(totalInput), Self.fmt(totalOutput), Self.fmt(totalCache),
+            totalCost, peak ? "高峰" : "空闲"
+        )
+        statusLabel.stringValue = "单价来自 DeepSeek 官方定价页"
+    }
+
+    @objc func modelChanged() {
+        refreshUsage()
     }
 
     @objc func refreshBalance() {
@@ -328,6 +391,7 @@ final class UsagePanelController: NSObject, NSTableViewDataSource, NSTableViewDe
         case "输入": text = Self.fmt(entry.inputTokens)
         case "输出": text = Self.fmt(entry.outputTokens)
         case "缓存读取": text = Self.fmt(entry.cacheReadTokens)
+        case "费用(元)": text = String(format: "%.2f", pricing.cost(row: entry))
         default: text = ""
         }
         let field: NSTextField
