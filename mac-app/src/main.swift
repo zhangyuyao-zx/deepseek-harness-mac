@@ -237,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var hotKeyRef: EventHotKeyRef?
     var spawnedReadyNotified = false
     var fullShutdown = false
+    let usagePanel = UsagePanelController()
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -373,6 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         appMenu.addItem(withTitle: "关于 DeepSeek 助手",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
+        let usageItem = NSMenuItem(title: "用量与余额…", action: #selector(showUsagePanel), keyEquivalent: "")
+        usageItem.target = self
+        appMenu.addItem(usageItem)
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "隐藏 DeepSeek 助手",
                         action: #selector(NSApplication.hide(_:)),
@@ -466,6 +470,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
+    @objc func showUsagePanel() {
+        usagePanel.show()
+    }
+
     @objc func quitKeepingServer() {
         fullShutdown = false
         NSApp.terminate(nil)
@@ -503,6 +511,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         launch.target = self
         launch.state = launchAtLoginEnabled() ? .on : .off
         menu.addItem(launch)
+        menu.addItem(NSMenuItem.separator())
+        let usageItem = NSMenuItem(title: "用量与余额…", action: #selector(showUsagePanel), keyEquivalent: "")
+        usageItem.target = self
+        menu.addItem(usageItem)
         menu.addItem(NSMenuItem.separator())
         let quitSoft = NSMenuItem(title: "退出（服务继续后台运行）", action: #selector(quitKeepingServer), keyEquivalent: "q")
         quitSoft.target = self
